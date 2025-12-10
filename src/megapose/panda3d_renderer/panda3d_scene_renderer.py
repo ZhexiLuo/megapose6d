@@ -332,7 +332,7 @@ class Panda3dSceneRenderer:
                 h, w = rendering_n.depth.shape[:2]
                 binary_mask = np.zeros((h, w), dtype=np.bool_)
                 binary_mask[rendering_n.depth[..., 0] > 0] = 1
-                rendering.binary_mask = binary_mask
+                rendering_n.binary_mask = binary_mask
 
         render_time = time.time() - start
 

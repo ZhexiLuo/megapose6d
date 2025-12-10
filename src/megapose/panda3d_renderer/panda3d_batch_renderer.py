@@ -17,6 +17,7 @@ limitations under the License.
 
 
 # Standard Library
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Set, Union
 
@@ -88,20 +89,27 @@ class RenderArguments:
 
 def worker_loop(
     worker_id: int,
-    in_queue: torch.multiprocessing.Queue,
-    out_queue: torch.multiprocessing.Queue,
-    object_dataset: RigidObjectDataset,
+    in_queue,
+    out_queue,
+    object_dataset,
     preload_labels: Set[str] = set(),
 ) -> None:
+    """
+    Drop-in replacement for the original `worker_loop`:
+    - No `torch.*` calls in the worker;
+    - Use Panda3D to render and return NumPy arrays only;
+    - Preserve the original queue protocol and data structures.
+    """
 
-    logger.debug(f"Init worker: {worker_id}")
+    logger.debug(f"Init worker (safe): {worker_id}")
+
     renderer = Panda3dSceneRenderer(
         asset_dataset=object_dataset,
         preload_labels=preload_labels,
     )
 
     while True:
-        render_args: Union[RenderArguments, None] = in_queue.get()
+        render_args = in_queue.get()
         if render_args is None:
             break
 
@@ -113,17 +121,13 @@ def worker_loop(
         )
 
         if is_valid:
-            # Set copy_arrays=True so that the numpy
-            # arrays are contiguous. This ensures that they
-            # have non-negative strides and can be converted into
-            # torch.tensors.
             renderings = renderer.render_scene(
                 object_datas=scene_data.object_datas,
                 camera_datas=[scene_data.camera_data],
                 light_datas=scene_data.light_datas,
                 render_normals=render_args.render_normals,
                 render_depth=render_args.render_depth,
-                copy_arrays=True,  # ensures non-negative strid
+                copy_arrays=True,
             )
             renderings_ = renderings[0]
         else:
@@ -134,20 +138,18 @@ def worker_loop(
                 depth=np.zeros((h, w, 1), dtype=np.float32),
             )
 
+        assert isinstance(renderings_.rgb, np.ndarray)
+
         output = RenderOutput(
             data_id=render_args.data_id,
-            rgb=torch.tensor(renderings_.rgb).share_memory_(),
-            normals=torch.tensor(renderings_.normals).share_memory_()
-            if render_args.render_normals
-            else None,
-            depth=torch.tensor(renderings_.depth).share_memory_()
-            if render_args.render_depth
-            else None,
+            rgb=renderings_.rgb,
+            normals=renderings_.normals if render_args.render_normals else None,
+            depth=renderings_.depth if render_args.render_depth else None,
         )
         del render_args
         out_queue.put(output)
 
-    logger.debug(f"Close worker: {worker_id}")
+    logger.debug(f"Close worker (safe): {worker_id}")
 
 
 class Panda3dBatchRenderer:
@@ -216,16 +218,21 @@ class Panda3dBatchRenderer:
 
     def render(
         self,
-        labels: List[str],
-        TCO: torch.Tensor,
-        K: torch.Tensor,
-        light_datas: List[List[Panda3dLightData]],
-        resolution: Resolution,
+        labels,
+        TCO,
+        K,
+        light_datas,
+        resolution,
         render_depth: bool = False,
         render_mask: bool = False,
         render_normals: bool = False,
-    ) -> BatchRenderOutput:
-
+    ):
+        """
+        Replacement for `Panda3dBatchRenderer.render`:
+        - Consume NumPy arrays produced by `safe_worker_loop`;
+        - Convert to torch tensors and move to GPU only in the main process;
+        - Keep the external `BatchRenderOutput` interface unchanged.
+        """
         if render_mask:
             raise NotImplementedError
 
@@ -239,15 +246,16 @@ class Panda3dBatchRenderer:
                 render_depth=render_depth,
                 render_normals=render_normals,
             )
-
-            in_queue = self._object_label_to_queue[scene_data_n.object_datas[0].label]
+            in_queue = self._object_label_to_queue[
+                scene_data_n.object_datas[0].label
+            ]
             in_queue.put(render_args)
 
         list_rgbs = [None for _ in np.arange(bsz)]
         list_depths = [None for _ in np.arange(bsz)]
         list_normals = [None for _ in np.arange(bsz)]
 
-        for n in np.arange(bsz):
+        for _ in np.arange(bsz):
             renders = self._out_queue.get()
             data_id = renders.data_id
             list_rgbs[data_id] = renders.rgb
@@ -257,21 +265,27 @@ class Panda3dBatchRenderer:
                 list_normals[data_id] = renders.normals
             del renders
 
+        # Convert NumPy arrays to torch tensors and move them to GPU
         assert list_rgbs[0] is not None
-        rgbs = torch.stack(list_rgbs).pin_memory().cuda(non_blocking=True)
-        rgbs = rgbs.float().permute(0, 3, 1, 2) / 255
+        rgbs_np = np.stack(list_rgbs, axis=0)  # [B,H,W,3]
+        rgbs = torch.from_numpy(rgbs_np).pin_memory().cuda(non_blocking=True)
+        rgbs = rgbs.float().permute(0, 3, 1, 2) / 255.0  # [B,3,H,W]
 
         if render_depth:
             assert list_depths[0] is not None
-            depths = torch.stack(list_depths).pin_memory().cuda(non_blocking=True)
+            depths_np = np.stack(list_depths, axis=0)  # [B,H,W,1]
+            depths = torch.from_numpy(depths_np).pin_memory().cuda(non_blocking=True)
             depths = depths.float().permute(0, 3, 1, 2)
         else:
             depths = None
 
         if render_normals:
             assert list_normals[0] is not None
-            normals = torch.stack(list_normals).pin_memory().cuda(non_blocking=True)
-            normals = normals.float().permute(0, 3, 1, 2) / 255
+            normals_np = np.stack(list_normals, axis=0)  # [B,H,W,3]
+            normals = (
+                torch.from_numpy(normals_np).pin_memory().cuda(non_blocking=True)
+            )
+            normals = normals.float().permute(0, 3, 1, 2) / 255.0
         else:
             normals = None
 
